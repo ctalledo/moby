@@ -3,9 +3,11 @@ package daemon // import "github.com/docker/docker/daemon"
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/containerd/log"
 	"github.com/docker/docker/api/types/backend"
@@ -113,7 +115,7 @@ func (daemon *Daemon) Containers(ctx context.Context, config *containertypes.Lis
 		return nil, err
 	}
 
-	// fastpath to only look at a subset of containers if specific name
+	// shortcut to only look at a subset of containers if specific name
 	// or ID matches were provided by the user--otherwise we potentially
 	// end up querying many more containers than intended
 	containerList, err := daemon.filterByNameIDMatches(view, filter)
@@ -121,14 +123,86 @@ func (daemon *Daemon) Containers(ctx context.Context, config *containertypes.Lis
 		return nil, err
 	}
 
+	filteredList := []container.Snapshot{}
 	for i := range containerList {
-		currentContainer := &containerList[i]
-		switch includeContainerInList(currentContainer, filter) {
+		c := containerList[i]
+		switch includeContainerInList(&c, filter) {
 		case excludeContainer:
 			continue
 		case stopIteration:
-			return containers, nil
+			break
 		}
+		filteredList = append(filteredList, c)
+	}
+
+	if len(filteredList) == 0 {
+		return []*containertypes.Summary{}, nil
+	}
+
+	// To accelerate processing, partition the filtered list and process each
+	// partition in parallel. This is useful because for each container in the
+	// list we need to refresh its image reference (e.g., in case the image was
+	// updated in the repository and therefore no longer matches the container's
+	// image), and that operation requires accessing the underlying image store
+	// which can be a bit slow (see https://github.com/moby/moby/issues/47581).
+	numContainers := len(filteredList)
+	numParts := log2(numContainers)
+	if numParts < 1 {
+		numParts = 1
+	}
+	partSize := int(math.Ceil(float64(numContainers) / float64(numParts)))
+
+	resultsChan := make(chan []*containertypes.Summary, numContainers)
+	errChan := make(chan error, numContainers)
+
+	var wg sync.WaitGroup
+	for i := 0; i < numParts; i++ {
+		// compute the start and end index for each partition
+		start := i * partSize
+		end := start + partSize
+
+		if end > numContainers {
+			// ensure we don't go out of bounds.
+			end = numContainers
+		}
+
+		partition := filteredList[start:end]
+		wg.Add(1)
+
+		// process the partition in a goroutine
+		go func(ctx context.Context, part []container.Snapshot, filter *listContext) {
+			defer wg.Done()
+			results, err := daemon.listContainers(ctx, part, filter)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			resultsChan <- results
+		}(ctx, partition, filter)
+	}
+
+	wg.Wait()
+
+	close(resultsChan)
+	close(errChan)
+
+	if len(errChan) > 0 {
+		err := <-errChan
+		return nil, err
+	}
+
+	for c := range resultsChan {
+		containers = append(containers, c...)
+	}
+
+	return containers, nil
+}
+
+func (daemon *Daemon) listContainers(ctx context.Context, containerList []container.Snapshot, filter *listContext) ([]*containertypes.Summary, error) {
+	containers := []*containertypes.Summary{}
+
+	for i := range containerList {
+		currentContainer := &containerList[i]
 
 		// transform internal container struct into api structs
 		newC, err := daemon.refreshImage(ctx, currentContainer)
@@ -136,7 +210,6 @@ func (daemon *Daemon) Containers(ctx context.Context, config *containertypes.Lis
 			return nil, err
 		}
 
-		// release lock because size calculation is slow
 		if filter.Size {
 			sizeRw, sizeRootFs, err := daemon.imageService.GetContainerLayerSize(ctx, newC.ID)
 			if err != nil {
@@ -633,4 +706,9 @@ func populateImageFilterByParents(ctx context.Context, ancestorMap map[image.ID]
 		ancestorMap[imageID] = true
 	}
 	return nil
+}
+
+// log2 calculates the floor of log base 2 of a number.
+func log2(n int) int {
+	return int(math.Log2(float64(n)))
 }
